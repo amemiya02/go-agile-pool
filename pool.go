@@ -119,51 +119,86 @@ func (p *Pool) Submit(task Task) {
 		return
 	}
 	p.wg.Add(1)
-	p.lock.Lock()
 
-	if atomic.LoadInt64(&p.runningWorkersNum) < p.capacity {
-		p.addRunningWorkersNum(1)
-		p.lock.Unlock()
+	// Fast path: claim a worker slot with a lock-free CAS instead of the
+	// pool mutex. The CAS makes the capacity check + increment atomic, which
+	// is all the mutex provided here; the stranded-task guards live in
+	// ensureQueueConsumed and in the worker's locked exit protocol. Keeping
+	// this path (and the common slow-path cases) off the mutex is what lets
+	// throughput scale with large worker capacities instead of collapsing
+	// under lock contention.
+	for {
+		running := atomic.LoadInt64(&p.runningWorkersNum)
+		if running >= p.capacity {
+			break
+		}
+		if !atomic.CompareAndSwapInt64(&p.runningWorkersNum, running, running+1) {
+			continue
+		}
 		p.muIdle.Lock()
 		w := p.idleWorks.Pop()
 		p.muIdle.Unlock()
-		if w != nil {
-			go w.run(task)
-		} else {
-			w := p.workerPool.Get().(*worker)
-			go w.run(task)
+		if w == nil {
+			w = p.workerPool.Get().(*worker)
 		}
+		go w.run(task)
 		return
 	}
-	p.lock.Unlock()
+
 	if p.config.workMode == NONBLOCK {
 		p.wg.Done()
 		return
 	}
 
 	p.taskQueue <- task
+	p.ensureQueueConsumed()
+}
 
-	// Safety net: if workers exited between our capacity check and the push
-	// above, tasks could be stranded in the channel buffer with no consumer.
+// ensureQueueConsumed is the safety net against the stranded-task race: a
+// task pushed to taskQueue right as the last workers decide to park could be
+// left with no consumer. It must be called after every push to taskQueue.
+//
+// One lock-free fast-out covers the common case: if the queue is observed
+// empty after the push, every queued task (ours included) has already been
+// consumed by a live worker goroutine, so there is nothing left to strand.
+// Our own send happens-before this len() read, so the read cannot predate
+// the push.
+//
+// Note that a fast-out based on observing runningWorkersNum >= capacity is
+// NOT sound: a parking worker re-checks the queue before it decrements the
+// counter (both under lock), so a submitter can push after that re-check yet
+// still read the not-yet-decremented counter and wrongly skip the net.
+func (p *Pool) ensureQueueConsumed() {
+	if len(p.taskQueue) == 0 {
+		return
+	}
 	// Re-check under lock and spawn enough workers to drain the queue, up to
-	// capacity. See TestQueueStuckRace for the race this guards against.
+	// capacity. The lock serializes this decision against the workers' locked
+	// park/exit protocol. See TestAgilePoolRaceStuckTaskInQueue for the race
+	// this guards against.
 	p.lock.Lock()
-	running := atomic.LoadInt64(&p.runningWorkersNum)
 	target := int64(len(p.taskQueue))
 	if target > p.capacity {
 		target = p.capacity
 	}
-	toSpawn := target - running
-	if toSpawn > 0 {
-		p.addRunningWorkersNum(toSpawn)
-		p.lock.Unlock()
-		for i := int64(0); i < toSpawn; i++ {
-			w := p.workerPool.Get().(*worker)
-			go w.run(nil)
+	// Claim each slot with a CAS rather than a blind add: Submit's lock-free
+	// fast path increments runningWorkersNum concurrently without holding the
+	// lock, so only a bounded CAS keeps the count from exceeding capacity.
+	toSpawn := int64(0)
+	for {
+		running := atomic.LoadInt64(&p.runningWorkersNum)
+		if running >= target {
+			break
 		}
-		return
+		if atomic.CompareAndSwapInt64(&p.runningWorkersNum, running, running+1) {
+			toSpawn++
+		}
 	}
 	p.lock.Unlock()
+	for i := int64(0); i < toSpawn; i++ {
+		w := p.workerPool.Get().(*worker)
+		go w.run(nil)
+	}
 }
 
 // Submits a task before the specified timeout. If timeout is reached during execution, the task is canceled.
